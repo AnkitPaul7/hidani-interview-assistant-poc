@@ -64,6 +64,11 @@ export function useSession(): UseSessionReturn {
   const contextRef = useRef<InterviewContext>({ resume: '', jd: '', answerMode: 'concise' });
   const simulationModeRef = useRef<boolean>(false);
   const isManuallyStoppedRef = useRef<boolean>(false);
+  const sessionStateRef = useRef<SessionState>('idle');
+  const reconnectAttemptRef = useRef(0);
+
+  // Keep a ref in sync so socket callbacks never read a stale sessionState
+  sessionStateRef.current = sessionState;
 
   const connectWebSocket = useCallback(() => {
     if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) {
@@ -79,9 +84,11 @@ export function useSession(): UseSessionReturn {
         setIsConnected(true);
         setIsReconnecting(false);
         setReconnectAttempt(0);
+        reconnectAttemptRef.current = 0;
 
         // If connection was lost during an active session, auto-resubmit start packet
-        if (!isManuallyStoppedRef.current && (sessionState === 'listening' || sessionState === 'answering' || sessionState === 'thinking')) {
+        const activeState = sessionStateRef.current;
+        if (!isManuallyStoppedRef.current && (activeState === 'listening' || activeState === 'answering' || activeState === 'thinking')) {
           const startMsg: ClientMessage = {
             type: 'session.start',
             payload: {
@@ -112,21 +119,21 @@ export function useSession(): UseSessionReturn {
 
         // Auto-reconnect with exponential backoff if not manually closed
         if (!isManuallyStoppedRef.current) {
-          setIsReconnecting(true);
-          setReconnectAttempt((prev) => {
-            const nextAttempt = prev + 1;
-            if (nextAttempt <= WS_CONFIG.MAX_RECONNECT_ATTEMPTS) {
-              const backoff = Math.min(
-                WS_CONFIG.RECONNECT_BASE_MS * Math.pow(2, nextAttempt - 1),
-                WS_CONFIG.RECONNECT_MAX_MS
-              );
-              reconnectTimeoutRef.current = setTimeout(connectWebSocket, backoff);
-            } else {
-              setSessionState('error');
-              setStatusDetails('Connection lost. Please check if the backend server is running.');
-            }
-            return nextAttempt;
-          });
+          const nextAttempt = reconnectAttemptRef.current + 1;
+          reconnectAttemptRef.current = nextAttempt;
+          setReconnectAttempt(nextAttempt);
+          if (nextAttempt <= WS_CONFIG.MAX_RECONNECT_ATTEMPTS) {
+            setIsReconnecting(true);
+            const backoff = Math.min(
+              WS_CONFIG.RECONNECT_BASE_MS * Math.pow(2, nextAttempt - 1),
+              WS_CONFIG.RECONNECT_MAX_MS
+            );
+            reconnectTimeoutRef.current = setTimeout(connectWebSocket, backoff);
+          } else {
+            setIsReconnecting(false);
+            setSessionState('error');
+            setStatusDetails('Connection lost. Please check if the backend server is running.');
+          }
         }
       };
 
@@ -136,9 +143,12 @@ export function useSession(): UseSessionReturn {
     } catch (err) {
       console.error('[Session] Failed to connect WebSocket:', err);
     }
-  }, [sessionState]);
+  }, []);
 
   useEffect(() => {
+    // connectWebSocket is stable ([] deps) so this only runs on mount/unmount;
+    // previously it re-ran on every state change, closing the socket each time.
+    isManuallyStoppedRef.current = false;
     connectWebSocket();
 
     return () => {
@@ -267,7 +277,7 @@ export function useSession(): UseSessionReturn {
   };
 
   const sendAudioChunk = (buffer: ArrayBuffer) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN && sessionState !== 'idle') {
+    if (wsRef.current?.readyState === WebSocket.OPEN && sessionStateRef.current !== 'idle') {
       wsRef.current.send(buffer);
     }
   };

@@ -30,6 +30,20 @@ export class ClientSession {
   private simulationMode = false;
   private lastSpeechEndTime = Date.now();
 
+  // Basic rate limiting: sliding windows of timestamps (JSON control msgs, LLM answers)
+  private static readonly MSG_LIMIT = { max: 60, windowMs: 10_000 };
+  private static readonly QUESTION_LIMIT = { max: 15, windowMs: 60_000 };
+  private msgTimes: number[] = [];
+  private questionTimes: number[] = [];
+
+  private isRateLimited(times: number[], limit: { max: number; windowMs: number }): boolean {
+    const now = Date.now();
+    while (times.length && now - times[0] > limit.windowMs) times.shift();
+    if (times.length >= limit.max) return true;
+    times.push(now);
+    return false;
+  }
+
   constructor(ws: WebSocket, sessionId: string) {
     this.ws = ws;
     this.sessionId = sessionId;
@@ -59,6 +73,11 @@ export class ClientSession {
   public handleClientMessage(data: Buffer | string, isBinary: boolean): void {
     if (isBinary) {
       this.handleBinaryAudio(data as Buffer);
+      return;
+    }
+
+    if (this.isRateLimited(this.msgTimes, ClientSession.MSG_LIMIT)) {
+      this.sendError('RATE_LIMITED', 'Too many messages, slow down', true);
       return;
     }
 
@@ -192,6 +211,11 @@ export class ClientSession {
    * Orchestrates prompt creation, LLM streaming, and token dispatch for a detected question
    */
   private async handleDetectedQuestion(q: DetectedQuestionEvent): Promise<void> {
+    if (this.isRateLimited(this.questionTimes, ClientSession.QUESTION_LIMIT)) {
+      this.sendError('RATE_LIMITED', 'Too many questions per minute, skipping answer', true);
+      return;
+    }
+
     this.activeQuestionId = q.id;
     this.currentMetricsTracker = new QuestionMetricsTracker(q.id, this.lastSpeechEndTime);
     this.currentMetricsTracker.markTranscriptFinal();
